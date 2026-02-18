@@ -13,6 +13,7 @@ without making any changes. Pass --apply to actually apply changes to the OVN DB
 
 Usage:
     # Dry-run (default): only log planned changes
+    # --node-name can be either a chassis name or hostname
     python evict_ovn_router.py --node-name chassis-01 \
         --nb-db tcp:192.168.1.1:6641 \
         --sb-db tcp:192.168.1.1:6642
@@ -91,32 +92,57 @@ def connect_to_ovn_dbs(
     return (nb_api, sb_api)
 
 
-def resolve_hostname_to_chassis_name(
+def resolve_node_name_to_chassis_name(
     sb_api: sb_impl.OvnSbApiIdlImpl,
-    hostname: str,
+    node_name: str,
     logger: logging.Logger,
 ) -> str:
-    """Resolve hostname to chassis name (UUID)."""
-    logger.info(f"Resolving hostname '{hostname}' to chassis name")
+    """
+    Resolve node name to chassis name (UUID).
+
+    First checks if the passed value is a chassis name.
+    If not found, checks if it's a hostname and resolves it to a chassis name.
+    """
+    logger.info(f"Resolving node name '{node_name}' to chassis name")
+
+    # First, check if the passed value is already a chassis name
     chassis_rows = sb_api.db_find_rows(
         "Chassis",
-        ('hostname', '=', hostname)
+        ('name', '=', node_name)
+    ).execute()
+
+    if chassis_rows:
+        if len(chassis_rows) > 1:
+            chassis_names = [row.name for row in chassis_rows]
+            raise ValueError(
+                f"Multiple chassis found with name '{node_name}': {chassis_names}. "
+                "Cannot determine which chassis to evict."
+            )
+        chassis_name = chassis_rows[0].name
+        logger.info(f"Found chassis name '{chassis_name}' directly")
+        return chassis_name
+
+    # If not found as chassis name, try resolving as hostname
+    logger.info(f"Node name '{node_name}' not found as chassis name, trying as hostname")
+    chassis_rows = sb_api.db_find_rows(
+        "Chassis",
+        ('hostname', '=', node_name)
     ).execute()
 
     if not chassis_rows:
         raise ValueError(
-            f"Chassis with hostname '{hostname}' not found in OVN Southbound database"
+            f"Chassis with name or hostname '{node_name}' not found in OVN Southbound database"
         )
 
     if len(chassis_rows) > 1:
         chassis_names = [row.name for row in chassis_rows]
         raise ValueError(
-            f"Multiple chassis found with hostname '{hostname}': {chassis_names}. "
+            f"Multiple chassis found with hostname '{node_name}': {chassis_names}. "
             "Cannot determine which chassis to evict."
         )
 
     chassis_name = chassis_rows[0].name
-    logger.info(f"Resolved hostname '{hostname}' to chassis name '{chassis_name}'")
+    logger.info(f"Resolved hostname '{node_name}' to chassis name '{chassis_name}'")
     return chassis_name
 
 
@@ -455,8 +481,9 @@ def run_eviction_loop(
         nb_db, sb_db, db_connection_timeout, db_probe_interval, logger
     )
 
-    # Resolve hostname to chassis name (UUID)
-    chassis_name = resolve_hostname_to_chassis_name(sb_api, node_name, logger)
+    # Resolve node name to chassis name (UUID)
+    # First checks if it's a chassis name, then falls back to hostname resolution
+    chassis_name = resolve_node_name_to_chassis_name(sb_api, node_name, logger)
     
     try:
         for iteration in itertools.count():
@@ -501,7 +528,7 @@ def main() -> int:
     parser.add_argument(
         "--node-name",
         required=True,
-        help="Hostname of the chassis node to evict (will be resolved to chassis UUID)"
+        help="Chassis name or hostname of the chassis node to evict (will be resolved to chassis UUID)"
     )
     parser.add_argument(
         "--nb-db",
